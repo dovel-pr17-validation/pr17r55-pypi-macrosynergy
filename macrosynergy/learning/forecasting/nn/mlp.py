@@ -1,0 +1,1686 @@
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import BaseCrossValidator
+
+from typing import Optional
+import inspect
+
+from macrosynergy.learning.forecasting.torch.samplers.timeseries_sampler import TimeSeriesSampler
+from macrosynergy.learning.forecasting.torch.models.mlps import MultiLayerPerceptron
+
+from copy import deepcopy
+
+import numbers
+
+class MLPRegressor(BaseEstimator, RegressorMixin):
+    """
+    Multi-layer perceptron/feed-forward neural network, implemented in PyTorch, for use 
+    within the `scikit-learn` API.
+
+    Parameters
+    ----------
+    n_latent : Union[int, List[int]], optional
+        Number of hidden units in the latent layer(s) of the MLP.
+        If an integer is provided, the MLP will have a single hidden layer with n_latent
+        units. If a list of integers is provided, the MLP will have multiple hidden layers
+        with the number of units in each layer specified by the corresponding element in
+        the list. If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is 32.
+    fit_encoder_intercept : bool, optional
+        Whether to include an intercept (bias term) in the encoder layers of the MLP.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is True.
+    fit_head_intercept : bool, optional
+        Whether to include an intercept (bias term) in the output layer of the MLP.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is True.
+    encoder_activation : str, optional
+        Activation function for the encoder (hidden) component of the network.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is "relu".
+        Must be one of "tanh", "relu", "sigmoid", "gelu" or "silu".
+    head_activation : str, optional
+        Activation function for the head (output) component of the network.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is "identity". Must be one
+        of "tanh", "relu", "sigmoid", "softmax" or "identity".
+    signal_modifier : nn.Module, optional
+        Module to modify the output of the neural network in accordance with the intention of the trading strategy and the loss function. 
+        For example, `nn.Softmax(dim = 1)` is appropriate for a long-only strategy with a unit sum requirement
+        and a portfolio-wide loss function. If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is None.
+    head_rank : int, optional
+        Rank of the head (output) component of the network. This makes sense only for
+        multi-output neural networks. If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is None.
+    dropout_p : float, optional
+        Dropout probability for the encoder (hidden) component of the network.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is 0.
+    normalization: str, optional
+        Whether to apply normalization following each linear layer in the encoder (hidden) component of the network.
+        Can be either "layer" for LayerNorm or "batch" for BatchNorm.
+        If provided, all (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation)
+        must be specified and torch_model must be None. Default is None.
+    torch_model : Intersection[torch.nn.Module, BaseEstimator], optional
+        Custom PyTorch model to use instead of the default MLP. Must be a subclass of both
+        torch.nn.Module and sklearn.base.BaseEstimator. If torch_model is provided, all 
+        parameters (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation, dropout_p, head_rank, signal_modifier, normalization)
+        must be None. Default is None.
+    loss_func : torch.nn.Module, optional
+        Loss function used during training. Must be a subclass of torch.nn.Module.
+        Default is nn.MSELoss().
+    optimizer : Union[str, List[str]], optional
+        Optimizer(s) used during training. If a single string is provided, it specifies the
+        optimizer used in backpropagation. If a list of strings is provided, each string
+        specifies an optimizer to be used in separate training runs, forming an neural
+        network ensemble. Currently supported optimizers are "AdamW", "Adam", "SGD", and "SGD+mom".
+        Default is "AdamW".
+    scheduler : Optional[str], optional
+        Learning rate scheduler used during training. Currently supported schedulers are
+        "OneCycleLR" and None. Default is None.
+    batch_size : int, optional
+        Batch size used during training. Default is 32.
+    learning_rate : float, optional
+        Learning rate used by the optimizer. Default is 3e-4.
+    weight_decay : float, optional
+        Weight decay used by the optimizer. Default is 1e-4.
+    reg_turnover : float, optional
+        L2 regularization strength for the turnover in model outputs. Default is 0.
+    use_ts_sampler : bool, optional
+        Whether to use a time-series aware batch sampler during training.
+        Default is True.
+    aggregate_last : bool, optional
+        When using time-series batch sampling, whether or not to aggregate the last batch
+        into the previous batch if it is smaller than the specified batch size. When True,
+        `drop_last` must be False. Default is True.
+    drop_last : bool, optional
+        When using time-series batch sampling, whether or not to drop the last batch if it
+        is smaller than the specified batch size. When True, `aggregate_last` must be
+        False. Default is False.
+    epochs : int, optional
+        Maximum number of training epochs. Default is 10000.
+    patience : int, optional
+        Number of epochs to wait for improvement before early stopping. If None, 
+        early stopping is disabled. Default is 1000.
+    train_splitter : float or BaseCrossValidator, optional
+        If a float, it is the fraction of samples used for training (remainder used for
+        validation). If a BaseCrossValidator, it is used to split the data into training
+        and validation sets. This is needed to estimate the number of epochs to terminate
+        training. If patience is None, this parameter is ignored. Default is 0.7.
+    x_scaler : Optional[TransformerMixin], optional
+        Scaler for the input features. Must be a subclass of sklearn's TransformerMixin.
+        This can also be set to None.
+        Default is StandardScaler(with_mean=False).
+    y_scaler : Optional[TransformerMixin], optional
+        Scaler for the target values. Must be a subclass of sklearn's TransformerMixin.
+        This can also be set to None.
+        Default is StandardScaler(with_mean=False).
+    refit : bool, optional
+        Whether to refit the model on the entire dataset after early stopping. Default is False.
+    verbose : bool, optional
+        Whether to print training diagnostics during training. Default is False.
+    random_state : Union[int, List[int]], optional
+        Random seed(s) used for PyTorch initialization and training. If multiple seeds
+        are spsecified, then a neural network ensemble will be trained with each seed
+        in the list. Default is 42.
+    inverse_transform_preds : bool, optional
+        Whether to inverse-transform predictions back to the original target scale using
+        the fitted target scaler. Default is False.
+    min_samples : int, optional
+        Minimum number of samples for an asset to have a head in the neural network.
+        Default is 36.
+
+    Notes
+    -----
+    A neural network is a parametric model that, given a collection of input features, 
+    learns a mapping to target values by passing the feature set through "neurons", which
+    are themselves the composition of a linear transformation and a non-linear 'activation
+    function'. The output of these neurons should be interpreted as latent factors. These
+    neuron outputs can then be passed through further neurons, and so on, until the final
+    'layer' of neurons that produces the model predictions. The parameters of the linear
+    transformations are learned during training. This is the basic structure of a neural
+    network, with other types of neural network building upon this to handle sequential 
+    data/images/videos more efficiently. 
+
+    When the input dataset is tabular, with each sample consisting of a set of features
+    and a target value, and each treated as independent, then the model defined by mapping
+    the input features to a layer of latent factors via neurons, then (possibly) to 
+    another layer of latent factors, and so on, until the final layer of neurons that maps
+    to the target value(s), is called a multi-layer perceptron (MLP).
+
+    Learning corresponds to estimating the optimal parameters of the neural network. 
+    Optimality refers to the suitability of the parameters for the forecasting task at hand,
+    which is quantified by a loss function. `MLPRegressor` expects a PyTorch-compatible
+    loss function to be provided, which inherits from `torch.nn.Module` and has a `forward`
+    method that takes in the model predictions and the true target values and outputs 
+    a scalar loss value. The default loss function is mean squared error. Practically 
+    optimizing the parameters of this network is not trivial, because unlike an OLS model
+    (which optimizes mean squared error) the activation functions introduce non-linearity 
+    in the model, which (firstly) means that no closed-form solution exists for optimal
+    parameters, and (secondly) means that the loss landscape is non-convex with many 
+    local minima, saddle points and generically complicated geometry. The algorithm used 
+    to train such a neural network is called 'backpropogation', which involves:
+
+    1. Randomly initializing the parameters of the network
+    2. Passing the input features through the network to get (initially rubbish) predictions
+    3. Calculating the loss of the predictions with respect to the true target values
+    using the specified loss function
+    4. Calculating the derivative of the loss with respect to each parameter in the network,
+    based on the data.
+    5. Updating the parameters in the direction that reduces the loss, with the step size
+    determined by the learning rate and the optimizer. 
+    6. Iterating until convergence. 
+
+    Traditionally, the optimizer used in step 5 was stochastic gradient descent (SGD), 
+    which simply updates the parameters in the direction of the negative gradient of the loss. 
+    If one imagines a ball rolling down a hill, to get the bottom the ball has to move in
+    the direction of the steepest descent, which is the negative gradient. The 'stochastic'
+    part means that data is provided to the network in batches, meaning that the gradient
+    calculation is noisy. This noise is helpful for optimization because it prevents 
+    convergence to a poor minimum in the loss surface. In particular, SGD tends to converge
+    to flatter minima in the loss surface, which are associated with better generalization
+    performance. SGD, however, can be slow and other optimizers have been developed that
+    can converge faster, such as SGD + momentum, or AdamW.
+
+    The previous paragraph touches on the importance of the geometry of the loss surface 
+    for optimization and generalization. For those who are new to the world of neural
+    networks, it likely seems that the goal is to optimize the parameters to achieve the 
+    global minimum in the loss surface. This, however, is a bad idea. The global minimum 
+    is very likely to memorise the training data and consequently generalise poorly. This
+    is because the neural network typically has a vast number of parameters. This means 
+    that is in fact preferable to converge to a local minimum, particularly if we can 
+    characterise certain local minima as being better than others. Indeed, we can; we prefer
+    flatter minima rather than steep minima. Intuitively, if we converge to a steep minimum, 
+    then a small change in the underlying data leads us out of the minimum, indicating 
+    that the model is unstable and likely to generalise poorly. On the other hand,
+    small changes in the data do not lead us out of a flat minimum, indicating that the
+    model is stable and likely to generalise better. Certain techniques can be employed 
+    to encourage convergence to a flatter minimum, such as using a learning rate scheduler
+    that forces a large learning rate at periods of training, allowing the model to escape
+    steep minima, and reducing the learning rate when a favourable region of the parameter
+    space is being explored. Small batch sizes also encourage convergence to a flatter 
+    minimum. 
+
+    Convergence is also complicated by the fact that indefinite training of the network 
+    leads to overfitting. Early stopping is a common regularization strategy for neural
+    network training. The idea is split a training set into a smaller training subset 
+    and a validation subset. The model is trained on the training subset, but at the end
+    of each epoch (each complete pass of the training subset), it is evaluated against 
+    the validation subset. If the validation loss does not improve for a certain number of
+    epochs, then training is stopped and the parameters from the epoch with the best
+    validation loss are returned. 
+
+    In this implementation of a multilayer perceptron, the structure of the model is 
+    determined either by setting (`n_latent`, `fit_encoder_intercept`, `fit_head_intercept`, 
+    `encoder_activation`, `head_activation`) jointly or by providing a custom `torch_model`.
+    The loss function is determined by the `loss_func` parameter, and the training dynamics
+    are determined by the `optimizer`, `scheduler`, `batch_size`, `learning_rate`,
+    `weight_decay`, and `reg_turnover` parameters. Weight decay is a regularization strategy
+    that penalizes large weights in the network, whilst `reg_turnover` penalizes
+    large changes in model outputs from one time period to the next, which is useful
+    information when transaction cost data is incorporated in the loss function. 
+
+    The usual theory for neural network training is centred around each sample within a
+    batch being independent and identically distributed, implying that the random variables
+    corresponding to the derivative of the loss, for a fixed set of parameters, evaluated
+    at each sample are independent and identically distributed. This means that the average
+    derivative over a batch is a consistent, unbiased estimate of the true
+    gradient of the loss with respect to the parameters. On time series data, however,
+    mixing samples from different time periods leads to can lead to biased gradient estimates
+    due to the presence of different regimes within a single batch, violating the assumption
+    of samples coming from the same distribution. This confuses the learning process
+    because the model is pulled in conflicting directions by samples drawn from different
+    regimes, resulting in a poorly performing learning algorithm. To remedy this, we have
+    provided the option to use a time series-aware batch sampler that ensures that each
+    batch is comprised of samples from contiguous time periods. This should help
+    convergence. This can be toggled on/off with the `use_ts_sampler` parameter.
+
+    Further work
+    ------------
+    * Custom optimizer and scheduler
+    * LARS and ReduceLROnPlateau 
+    """
+    def __init__(
+        self,
+        # Neural network structure
+        n_latent = 32,
+        fit_encoder_intercept = True,
+        fit_head_intercept = True,
+        encoder_activation = "relu",
+        head_activation = "identity",
+        signal_modifier = None,
+        head_rank = None,
+        dropout_p = 0,
+        normalization = None,
+        torch_model = None,
+        # Neural network training dynamics
+        loss_func = torch.nn.MSELoss(),
+        optimizer: str = "AdamW", # TODO: Add lars and ability to pass in a custom optimizer. 
+        scheduler: Optional[str] = None, # TODO: options for other schedulers, probably ReduceLRonPlateau, option for custom scheduler object
+        batch_size = 32,
+        learning_rate = 3e-4,
+        weight_decay = 1e-4,
+        reg_turnover = 0,
+        use_ts_sampler = True, # TODO: turn this into an optional sampler object
+        aggregate_last = True,
+        drop_last = False,
+        epochs = 10000, # NOTE: when a scheduler is used, the epochs default is way too high unless the patience is high
+        patience = 1000,
+        train_splitter = 0.7,
+        x_scaler = StandardScaler(with_mean=False),
+        y_scaler = StandardScaler(with_mean=False), 
+        refit = False,
+        # Other stuff 
+        verbose = False,
+        random_state = 42,
+        inverse_transform_preds = False,
+        min_samples = 36
+    ):
+        # Checks 
+        self._check_init_params(
+            n_latent = n_latent,
+            fit_encoder_intercept = fit_encoder_intercept,
+            fit_head_intercept = fit_head_intercept,
+            encoder_activation = encoder_activation,
+            head_activation = head_activation,
+            signal_modifier = signal_modifier,
+            head_rank = head_rank,
+            dropout_p = dropout_p,
+            normalization = normalization,
+            torch_model = torch_model,
+            loss_func = loss_func,
+            optimizer = optimizer,
+            scheduler = scheduler,
+            batch_size = batch_size,
+            learning_rate = learning_rate,
+            weight_decay = weight_decay,
+            reg_turnover = reg_turnover,
+            use_ts_sampler = use_ts_sampler,
+            aggregate_last = aggregate_last,
+            drop_last = drop_last,
+            epochs = epochs,
+            patience = patience,
+            train_splitter = train_splitter,
+            x_scaler = x_scaler,
+            y_scaler = y_scaler,
+            refit = refit,
+            verbose = verbose,
+            random_state = random_state,
+            inverse_transform_preds = inverse_transform_preds,
+            min_samples = min_samples,
+        )
+
+        # Attributes
+        self.n_latent = n_latent
+        self.fit_encoder_intercept = fit_encoder_intercept
+        self.fit_head_intercept = fit_head_intercept
+        self.encoder_activation = encoder_activation
+        self.head_activation = head_activation
+        self.signal_modifier = signal_modifier
+        self.head_rank = head_rank
+        self.dropout_p = dropout_p
+        self.normalization = normalization
+        self.torch_model = torch_model
+        self.loss_func = loss_func
+        self.optimizer = optimizer
+        self.scheduler = scheduler 
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.reg_turnover = reg_turnover
+
+        self.use_ts_sampler = use_ts_sampler
+        self.aggregate_last = aggregate_last
+        self.drop_last = drop_last
+        self.epochs = epochs
+        self.patience = patience
+        self.train_splitter = train_splitter
+        self.x_scaler = x_scaler
+        self.y_scaler = y_scaler
+        self.refit = refit
+        self.verbose = verbose
+        self.random_state = random_state
+        self.inverse_transform_preds = inverse_transform_preds
+        self.min_samples = min_samples
+
+        self.optimizers = [self.optimizer] if not isinstance(self.optimizer, list) else self.optimizer
+        self.random_states = [self.random_state] if not isinstance(self.random_state, list) else self.random_state
+
+    def fit(self, X, y):
+        # Fit checks 
+        self._check_fit_params(X, y)
+
+        # Copy data and initialize empty list of models to be trained, with diagnostic
+        # dictionaries
+        X = X.copy()
+        y = y.copy()
+        self.models = []
+
+        self.early_stopping_dynamics = {}
+        self.early_stopping_inference = {}
+        self.final_model_inference = {}
+
+        # Data checks
+        # TODO: if torch_model is provided, check it has the right structure 
+        # to be trained by this class by passing a batch through it
+        self._check_fit_params(X, y)
+
+        # Filter assets with insufficient samples to have a head in the network
+        target_counts = y.count()
+        self.targets = target_counts[target_counts >= self.min_samples].index
+        self.n_targets = len(self.targets)
+
+        y = y[self.targets]
+
+        if self.patience is None:
+            # Then we are training a single model on the entire dataset, with no early stopping,
+            # but with possible different trainings for random seeds and optimizers.
+            X_s, y_s, _, _, x_scalers, y_scalers = self.scale_data_(
+                X_trains = [X],
+                y_trains = [y],
+                x_scaler = self.x_scaler,
+                y_scaler = self.y_scaler,
+            )
+            train_datasets, _ = self.make_tensor_datasets_(
+                X_trains_s = X_s,
+                y_trains_s = y_s,
+            )
+        else:
+            # Then we are training multiple models on different train/validation splits.
+            # If refit = False, the average model is used as the "final model".
+            # If refit = True, the number of stopping epochs is averaged across folds
+            # and a final model is trained on the entire dataset for that number of epochs.
+            X_trains, X_valids, y_trains, y_valids = self.create_train_valid_splits_(X, y, self.train_splitter)
+
+            # Scale training and validation splits for each fold 
+            X_trains_s, y_trains_s, X_valids_s, y_valids_s, x_scalers, y_scalers = self.scale_data_(X_trains, y_trains, self.x_scaler, self.y_scaler, X_valids, y_valids)
+
+            # Make tensor datasets for each fold 
+            train_datasets, valid_datasets = self.make_tensor_datasets_(
+                X_trains_s = X_trains_s,
+                y_trains_s = y_trains_s,
+                X_valids_s = X_valids_s,
+                y_valids_s = y_valids_s
+            )
+            
+        # Iterate through random states
+        for optim_idx, optimizer in enumerate(self.optimizers):
+            for random_state_idx, random_state in enumerate(self.random_states):
+                # Set seed 
+                torch.manual_seed(random_state)
+
+                # Initialize early stopping dictionaries
+                self.early_stopping_dynamics[(optim_idx, random_state_idx)] = {
+                    # Loss paths 
+                    "train_loss_path": [],
+                    "valid_loss_path": [],
+                    "generalization_gap_path": [],
+                    "patience_counter_path": [],
+                    "improvement_path": [],
+                    "improvement_path_diff": [],
+        
+                    # Best model information
+                    "selected_epoch": [],
+                    "termination_epoch": [],
+                    "bestmodel_train_loss": [],
+                    "bestmodel_valid_loss": [],
+                    "bestmodel_generalization_gap": [],
+                }
+
+                self.early_stopping_inference[(optim_idx, random_state_idx)] = {
+                    # Best model gradient information
+                    "gradient_mean_per_layer": [],
+                    "gradient_std_per_layer": [],
+                    "gradient_max_per_layer": [],
+                    "gradient_min_per_layer": [],
+                    "gradient_norm_per_layer": [],
+                    "global_gradient_norm": [],
+
+                    # Best model NaN and inf checks
+                    "train_loss_isnan": [],
+                    "train_loss_isinf": [],
+                    "nan_gradients_per_layer": [],
+                    "inf_gradients_per_layer": [],
+                    "nan_gradients_global": [],
+                    "inf_gradients_global": [],
+
+                    # Loss and target sensitivities
+                    "training_loss_sensitivity": [],
+                    "training_target_sensitivities": [],
+                }
+
+                self.final_model_inference[(optim_idx, random_state_idx)] = {
+                    # Best model gradient information
+                    "gradient_mean_per_layer": {},
+                    "gradient_std_per_layer": {},
+                    "gradient_max_per_layer": {},
+                    "gradient_min_per_layer": {},
+                    "gradient_norm_per_layer": {},
+                    "global_gradient_norm": None,
+
+                    # Best model NaN and inf checks
+                    "train_loss_isnan": None,
+                    "train_loss_isinf": None,
+                    "nan_gradients_per_layer": {},
+                    "inf_gradients_per_layer": {},
+                    "nan_gradients_global": None,
+                    "inf_gradients_global": None,
+
+                    # Loss and target sensitivities
+                    "training_loss_sensitivity": [],
+                    "training_target_sensitivities": [],
+                }
+
+                if self.patience is None:
+                    # Initialize model
+                    model = self.initialize_model(
+                        torch_model = self.torch_model,
+                        n_inputs = X.shape[1],
+                        n_latent = self.n_latent,
+                        n_outputs = y.shape[1],
+                        encoder_activation = self.encoder_activation,
+                        head_activation = self.head_activation,
+                        fit_encoder_intercept = self.fit_encoder_intercept,
+                        fit_head_intercept = self.fit_head_intercept,
+                        signal_modifier = self.signal_modifier,
+                        head_rank = self.head_rank,
+                        dropout_p = self.dropout_p,
+                        normalization = self.normalization, 
+                    )
+    
+                    # Set up optimizer 
+                    optim = self.make_optimizer(model, optimizer, self.learning_rate, self.weight_decay)
+
+                    # Make torch dataloaders
+                    train_loader, _, _ = self.make_dataloaders_(
+                        train_dataset = train_datasets[0],
+                        batch_size = self.batch_size,
+                        use_ts_sampler = self.use_ts_sampler,
+                        aggregate_last = self.aggregate_last,
+                        drop_last = self.drop_last,
+                        valid_dataset = None
+                    )
+                    if self.scheduler is not None:
+                        scheduler = self.make_scheduler(optim, self.scheduler, self.epochs, len(train_loader))
+                    else:
+                        scheduler = None
+
+                    # Train model
+                    model, _, _ = self.train_model(
+                        model = model,
+                        epochs = self.epochs,
+                        train_loader = train_loader,
+                        train_loader_eval = None,
+                        valid_loader = None, 
+                        optimizer = optim, 
+                        scheduler = scheduler,
+                        loss_func = self.loss_func,
+                        reg_turnover = self.reg_turnover, 
+                        patience = self.patience, 
+                        verbose = self.verbose,
+                    )
+
+                    # Store model diagnostics on gradients and NaN/inf checks
+                    model_diagnostics = self._get_model_diagnostics(model, torch.Tensor(X_s[0]), torch.Tensor(y_s[0]))
+                    self.final_model_inference[(optim_idx, random_state_idx)].update(model_diagnostics)
+
+                    # Infer properties of the trained model
+                    model_inference = self._inspect_model(model, torch.Tensor(X_s[0]), torch.Tensor(y_s[0]))
+                    self.final_model_inference[(optim_idx, random_state_idx)].update(model_inference)
+                    
+                    self.models.append(model)
+                else:
+                    self.validated_models = []
+                    self.mean_epochs_es = 0
+                    for idx, (train_dataset, valid_dataset) in enumerate(zip(train_datasets, valid_datasets)):
+                        torch.manual_seed(random_state)
+
+                        # Initialize model
+                        model = self.initialize_model(
+                            torch_model = self.torch_model,
+                            n_inputs = X.shape[1],
+                            n_latent = self.n_latent,
+                            n_outputs = y.shape[1],
+                            encoder_activation = self.encoder_activation,
+                            head_activation = self.head_activation,
+                            fit_encoder_intercept = self.fit_encoder_intercept,
+                            fit_head_intercept = self.fit_head_intercept,
+                            signal_modifier = self.signal_modifier,
+                            head_rank = self.head_rank,
+                            dropout_p = self.dropout_p,
+                            normalization = self.normalization, 
+                        )
+        
+                        # Set up optimizer 
+                        optim = self.make_optimizer(model, optimizer, self.learning_rate, self.weight_decay)
+
+                        train_loader, train_loader_eval, valid_loader = self.make_dataloaders_(
+                            train_dataset = train_dataset,
+                            batch_size = self.batch_size,
+                            use_ts_sampler = self.use_ts_sampler,
+                            aggregate_last = self.aggregate_last,
+                            drop_last = self.drop_last,
+                            valid_dataset = valid_dataset
+                        )
+                        if self.scheduler is not None:
+                            scheduler = self.make_scheduler(optim, self.scheduler, self.epochs, len(train_loader))
+                        else:
+                            scheduler = None
+
+                        # Train model
+                        model_es, epochs_es, early_stopping_trace = self.train_model(
+                            model = model,
+                            epochs = self.epochs,
+                            train_loader = train_loader,
+                            train_loader_eval = train_loader_eval,
+                            valid_loader = valid_loader,
+                            optimizer = optim,
+                            scheduler = scheduler,
+                            loss_func = self.loss_func,
+                            reg_turnover = self.reg_turnover,
+                            patience = self.patience,
+                            verbose = self.verbose,
+                        )
+
+                        # Store early stopping information
+                        for key, value in early_stopping_trace.items():
+                            self.early_stopping_dynamics[(optim_idx, random_state_idx)][key].append(value)
+
+                        # Store model diagnostics on gradients and NaN/inf checks
+                        model_diagnostics = self._get_model_diagnostics(model_es, torch.Tensor(X_trains_s[idx]), torch.Tensor(y_trains_s[idx]))
+                        for key, value in model_diagnostics.items():
+                            self.early_stopping_inference[(optim_idx, random_state_idx)][key].append(value)
+
+                        # Infer properties of the trained model
+                        model_inference = self._inspect_model(model_es, torch.Tensor(X_trains_s[idx]), torch.Tensor(y_trains_s[idx]))
+                        for key, value in model_inference.items():
+                            self.early_stopping_inference[(optim_idx, random_state_idx)][key].append(value)
+
+                        self.validated_models.append(model_es)
+                        self.mean_epochs_es += epochs_es
+                    self.mean_epochs_es /= len(self.validated_models)
+                    self.mean_epochs_es = int(self.mean_epochs_es)
+                    if self.refit:
+                        # Create training set dataloader over the full dataset
+                        X_s, y_s, _, _, x_scalers, y_scalers = self.scale_data_(
+                            X_trains = [X],
+                            y_trains = [y],
+                            x_scaler = self.x_scaler,
+                            y_scaler = self.y_scaler,
+                        )
+                        train_datasets, _ = self.make_tensor_datasets_(
+                            X_trains_s = X_s,
+                            y_trains_s = y_s
+                        )
+                        train_loader, _, _ = self.make_dataloaders_(
+                            train_dataset = train_datasets[0],
+                            batch_size = self.batch_size,
+                            use_ts_sampler = self.use_ts_sampler,
+                            aggregate_last = self.aggregate_last,
+                            drop_last = self.drop_last,
+                            valid_dataset = None
+                        )
+
+                        # Reset seed
+                        torch.manual_seed(random_state)
+
+                        # Reinitialize model
+                        final_model = self.initialize_model(
+                            torch_model = self.torch_model,
+                            n_inputs = X.shape[1],
+                            n_latent = self.n_latent,
+                            n_outputs = y.shape[1],
+                            encoder_activation = self.encoder_activation,
+                            head_activation = self.head_activation,
+                            fit_encoder_intercept = self.fit_encoder_intercept,
+                            fit_head_intercept = self.fit_head_intercept,
+                            signal_modifier = self.signal_modifier,
+                            head_rank = self.head_rank,
+                            dropout_p = self.dropout_p,
+                            normalization = self.normalization, 
+                        )
+
+                        optim = self.make_optimizer(final_model, optimizer, self.learning_rate, self.weight_decay)
+                        
+                        if self.scheduler is not None:
+                            scheduler = self.make_scheduler(optim, self.scheduler, int(self.mean_epochs_es), len(train_loader))
+                        else:
+                            scheduler = None
+
+                        # Train model
+                        model_full, _, _ = self.train_model(
+                            model = final_model,
+                            epochs = int(self.mean_epochs_es),
+                            train_loader = train_loader,
+                            train_loader_eval = None,
+                            valid_loader = None, 
+                            optimizer = optim, 
+                            scheduler = scheduler,
+                            loss_func = self.loss_func,
+                            reg_turnover = self.reg_turnover, 
+                            patience = None, 
+                            verbose = self.verbose,
+                        )
+
+                        # Infer properties of the trained model
+                        model_inference = self._inspect_model(model_full, torch.Tensor(X_s[0]), torch.Tensor(y_s[0]))
+                        for key, value in model_inference.items():
+                            self.final_model_inference[(optim_idx, random_state_idx)][key].append(value)
+
+                        self.models.append(model_full)
+
+                    else:
+                        self.models.append(self.validated_models)
+
+        self.x_scalers = x_scalers
+        self.y_scalers = y_scalers
+
+        return self
+    
+    def predict(self, X):
+        # Predict checks
+        self._check_predict_params(X)
+
+        # Scale data
+        Xs_s = [
+            x_scaler.transform(X) 
+            if x_scaler is not None
+            else X.to_numpy()
+            for x_scaler in self.x_scalers
+        ]
+
+        model_preds = []
+
+        with torch.no_grad():
+            for model in self.models:
+                if isinstance(model, list):
+                    # If model is a list of validated models, average predictions across them
+                    # First scale the input data
+                    preds_list = []
+                    for idx, m in enumerate(model):
+                        m.eval()
+                        X_s_torch = torch.Tensor(Xs_s[idx])
+                        preds = m(X_s_torch).numpy()
+
+                        # Inverse scale predictions
+                        if self.inverse_transform_preds:
+                            preds = self.y_scalers[idx].inverse_transform(preds)
+                        preds_list.append(preds)
+
+                    # Average predictions across validated models
+                    avg_preds = np.mean(np.stack(preds_list, axis=0), axis=0)
+                    model_preds.append(avg_preds)
+                else:
+                    model.eval()
+                    X_s_torch = torch.Tensor(Xs_s[0])
+                    preds = model(X_s_torch).numpy()
+
+                    # Inverse scale predictions
+                    if self.inverse_transform_preds:
+                        preds = self.y_scalers[0].inverse_transform(preds)
+                    model_preds.append(preds)
+
+        # Concatenate predictions and average across models
+        final_preds = np.mean(np.stack(model_preds, axis=0), axis = 0)
+
+        return pd.DataFrame(final_preds, index=X.index, columns=self.targets)
+
+    def initialize_model(
+        self,
+        torch_model,
+        n_inputs,
+        n_latent,
+        n_outputs,
+        encoder_activation,
+        head_activation,
+        fit_encoder_intercept,
+        fit_head_intercept,
+        signal_modifier,
+        head_rank,
+        dropout_p,
+        normalization,
+    ):            
+        if torch_model is not None:
+            # TODO: check this will work upfront
+            params = torch_model.get_params(deep=False)
+            model = type(torch_model)(**params)
+        else:
+            model = MultiLayerPerceptron(
+                n_inputs=n_inputs,
+                n_latent=n_latent,
+                n_outputs=n_outputs,
+                encoder_activation=encoder_activation,
+                head_activation=head_activation,
+                fit_encoder_intercept=fit_encoder_intercept,
+                fit_head_intercept=fit_head_intercept,
+                signal_modifier = signal_modifier,
+                head_rank=head_rank,
+                dropout_p=dropout_p,
+                normalization=normalization,
+            )
+
+        return model
+    
+    def create_train_valid_splits_(self, X, y, splitter):
+        """
+        Create train/validation splits based on the provided splitter object.
+        Output lists of X_trains, X_valids, y_trains, y_valids for each split.
+        """
+        X_trains, X_valids, y_trains, y_valids = [], [], [], []
+        if isinstance(splitter, BaseCrossValidator):
+            for train_idx, valid_idx in splitter.split(X, y):
+                X_trains.append(X.iloc[train_idx])
+                X_valids.append(X.iloc[valid_idx])
+                y_trains.append(y.iloc[train_idx])
+                y_valids.append(y.iloc[valid_idx])
+        else:
+            # it is a train_pct 
+            dates = sorted(X.index.get_level_values(1).unique())
+            cut = int(splitter * len(dates))
+            train_dates, valid_dates = dates[:cut], dates[cut:] # TODO: upfront check this doesn't create empty splits
+
+            X_train = X[X.index.get_level_values(1).isin(train_dates)]
+            y_train = y[y.index.get_level_values(1).isin(train_dates)]
+            X_valid = X[X.index.get_level_values(1).isin(valid_dates)]
+            y_valid = y[y.index.get_level_values(1).isin(valid_dates)]
+
+            X_trains.append(X_train)
+            X_valids.append(X_valid)
+            y_trains.append(y_train)
+            y_valids.append(y_valid)
+
+        return X_trains, X_valids, y_trains, y_valids
+    
+    def scale_data_(
+        self,
+        X_trains,
+        y_trains,
+        x_scaler,
+        y_scaler,
+        X_valids=None,
+        y_valids=None,
+    ):
+        """
+        Input list of X_trains, y_trains, x_scalers, y_scalers and optional X_valids, y_valids.
+        Output lists of scaled X_trains, y_trains, X_valids, y_valids.
+        """
+        X_trains_s, y_trains_s, X_valids_s, y_valids_s, x_scalers, y_scalers = [], [], [], [], [], []
+        for i in range(len(X_trains)):
+            X_train = X_trains[i]
+            y_train = y_trains[i]
+            X_valid = X_valids[i] if X_valids is not None else None
+            y_valid = y_valids[i] if y_valids is not None else None
+
+            if x_scaler is not None:
+                x_scaler_i = clone(x_scaler)
+                x_scaler_i.fit(X_train)
+                X_train_s = x_scaler_i.transform(X_train)
+                if X_valid is not None:
+                    X_valid_s = x_scaler_i.transform(X_valid)
+                else:
+                    X_valid_s = None
+            else:
+                X_train_s = X_train.values
+                if X_valid is not None:
+                    X_valid_s = X_valid.values
+                else:
+                    X_valid_s = None
+
+            # Scale dependent variables
+            if y_scaler is not None:
+                y_scaler_i = clone(y_scaler)
+                y_scaler_i.fit(y_train)
+                y_train_s = y_scaler_i.transform(y_train)
+                if y_valid is not None:
+                    y_valid_s = y_scaler_i.transform(y_valid)
+                else:
+                    y_valid_s = None
+            else:
+                y_train_s = y_train.values
+                if y_valid is not None:
+                    y_valid_s = y_valid.values
+                else:
+                    y_valid_s = None
+
+            X_trains_s.append(X_train_s)
+            y_trains_s.append(y_train_s)
+            X_valids_s.append(X_valid_s)
+            y_valids_s.append(y_valid_s)
+
+            if x_scaler is not None:
+                x_scalers.append(x_scaler_i)
+            else:
+                x_scalers.append(None)
+
+            if y_scaler is not None:
+                y_scalers.append(y_scaler_i)
+            else:
+                y_scalers.append(None)
+
+        return X_trains_s, y_trains_s, X_valids_s, y_valids_s, x_scalers, y_scalers
+    
+    def make_tensor_datasets_(
+        self,
+        X_trains_s,
+        y_trains_s,
+        X_valids_s = None,
+        y_valids_s = None,
+    ):
+        train_datasets = []
+        valid_datasets = []
+
+        for i in range(len(X_trains_s)):
+            train_dataset = torch.utils.data.TensorDataset(
+                torch.Tensor(X_trains_s[i]),
+                torch.Tensor(y_trains_s[i]),
+            )
+            if X_valids_s is not None:
+                valid_dataset = torch.utils.data.TensorDataset(
+                    torch.Tensor(X_valids_s[i]),
+                    torch.Tensor(y_valids_s[i]),
+                )
+            else:
+                valid_dataset = None
+
+            train_datasets.append(train_dataset)
+            valid_datasets.append(valid_dataset)
+
+        return train_datasets, valid_datasets
+
+    def make_dataloaders_(
+        self,
+        train_dataset,
+        batch_size,
+        use_ts_sampler,
+        aggregate_last,
+        drop_last,
+        valid_dataset = None
+    ):
+        """
+        TODO: run through aggregate last and drop last logic 
+        """
+        if not use_ts_sampler:
+            train_loader = torch.utils.data.DataLoader(
+                dataset = train_dataset,
+                batch_size = batch_size,
+                shuffle = True,
+                drop_last = drop_last
+            )
+            train_loader_eval = torch.utils.data.DataLoader(
+                dataset = train_dataset,
+                batch_size = batch_size,
+                shuffle = False,
+                drop_last = False,
+            )
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                dataset = train_dataset,
+                batch_sampler = TimeSeriesSampler(
+                    dataset=train_dataset,
+                    batch_size=batch_size,
+                    shuffle = True,
+                    aggregate_last = aggregate_last,
+                    drop_last = drop_last
+                )
+            )
+            train_loader_eval = torch.utils.data.DataLoader(
+                dataset = train_dataset,
+                batch_sampler = TimeSeriesSampler(
+                    dataset=train_dataset,
+                    batch_size=batch_size,
+                    shuffle = False,
+                    aggregate_last = aggregate_last,
+                    drop_last = False
+                )
+            )
+
+        if valid_dataset is not None:
+            valid_loader = torch.utils.data.DataLoader(
+                dataset = valid_dataset,
+                batch_sampler=TimeSeriesSampler(
+                    dataset=valid_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    aggregate_last = aggregate_last,
+                    drop_last = False
+                ),
+            )
+        else:
+            valid_loader = None
+
+        return train_loader, train_loader_eval, valid_loader
+    
+    def make_optimizer(self, model, optimizer_name, learning_rate, weight_decay):
+        if optimizer_name == "AdamW":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name == "SGD":
+            optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer_name == "SGD+mom":
+            optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum = 0.9)
+        elif optimizer_name == "Adam":
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        else:
+            # TODO: add LARS for large batch SGD training
+            # TODO: add ability to pass in an optimizer class inheriting from torch.optim.Optimizer
+            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+        
+        return optimizer
+    
+    def make_scheduler(self, optimizer, scheduler_name, epochs, steps_per_epoch):
+        if scheduler_name == "OneCycleLR":
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=self.learning_rate,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=0.3,
+                anneal_strategy='cos',
+            )
+        # elif scheduler_name == "ReduceLROnPlateau":
+        #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #         optimizer,
+        #         mode='min',
+        #         factor=0.1,
+        #         patience=int(self.patience / 2), # TODO: see what a reasonable default would be
+        #         verbose=self.verbose
+        #     )
+        else:
+            # TODO: add more schedulers later
+            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+        
+        return scheduler
+    
+    def train_model(
+        self,
+        model,
+        epochs,
+        train_loader,
+        train_loader_eval,
+        valid_loader,
+        optimizer,
+        scheduler,
+        loss_func,
+        reg_turnover,
+        patience,
+        verbose,
+    ):
+        best_state = None
+        best_score = np.inf
+        counter = 0
+        best_epoch = 0
+
+        early_stopping_trace = {
+            "train_loss_path": [],
+            "valid_loss_path": [],
+            "generalization_gap_path": [],
+            "patience_counter_path": [],
+            "improvement_path": [],
+            "improvement_path_diff": [],
+            "selected_epoch": None,
+            "termination_epoch": None,
+            "bestmodel_train_loss": None,
+            "bestmodel_valid_loss": None,
+            "bestmodel_generalization_gap": None,
+        }
+        
+        for epoch in range(epochs):
+            model.train()
+            for X_i, y_i in train_loader:
+                model = self._fit_one_batch(
+                    model = model,
+                    X_i = X_i,
+                    y_i = y_i,
+                    optimizer = optimizer,
+                    scheduler = scheduler,
+                    loss_func = loss_func,
+                    reg_turnover = reg_turnover
+                )  
+            
+            if patience is not None:
+                train_loss = self._eval_loss(model, train_loader_eval, loss_func)
+                valid_loss = self._eval_loss(model, valid_loader, loss_func)
+                early_stopping_trace["train_loss_path"].append(train_loss)
+                early_stopping_trace["valid_loss_path"].append(valid_loss)
+                early_stopping_trace["generalization_gap_path"].append(valid_loss - train_loss)
+                early_stopping_trace["improvement_path"].append(best_score - valid_loss)
+
+                best_score_new, best_state, counter = self.update_es_stats(
+                    model, train_loss, valid_loss, best_score, best_state, counter, patience
+                )
+                early_stopping_trace["patience_counter_path"].append(counter)
+
+                if best_score_new < best_score:
+                    best_score = best_score_new
+                    best_epoch  = epoch + 1
+                    early_stopping_trace["bestmodel_train_loss"] = train_loss
+                    early_stopping_trace["bestmodel_valid_loss"] = valid_loss
+                    early_stopping_trace["bestmodel_generalization_gap"] = valid_loss - train_loss
+
+                if verbose and (epoch % 5 == 0 or epoch == epochs - 1):
+                    print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}, Valid Loss = {valid_loss:.4f}, Best Valid Loss = {best_score:.4f}")
+
+                if counter >= patience:
+                    early_stopping_trace["termination_epoch"] = epoch + 1
+
+
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        else:
+            # TODO: handle this case later
+            pass
+
+        early_stopping_trace["selected_epoch"] = best_epoch
+
+        return model, best_epoch, early_stopping_trace
+
+    def _fit_one_batch(
+        self,
+        model,
+        X_i,
+        y_i,
+        optimizer,
+        scheduler,
+        loss_func,
+        reg_turnover
+    ):
+        optimizer.zero_grad()
+        preds = model(X_i)
+        
+        loss = loss_func(preds, y_i)
+
+        if reg_turnover > 0:
+            pweight_changes = preds[1:] - preds[:-1]
+            pweight_l2 = torch.mean(torch.sum(pweight_changes ** 2, dim=1))
+            loss = loss + reg_turnover * pweight_l2
+
+        loss.backward()
+        optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        return model
+    
+    def _eval_loss(self, model, loader, loss_func):
+        model.eval()
+        total_loss = 0.0
+        with torch.no_grad():
+            for X_i, y_i in loader:
+                preds = model(X_i)
+                total_loss += loss_func(preds, y_i).item()
+            avg_loss = total_loss / len(loader)
+
+        return avg_loss    
+    
+    def update_es_stats(self, model, train_loss, valid_loss, best_score, best_state, counter, patience):
+        if valid_loss < best_score:
+            best_score = valid_loss
+            best_state = deepcopy(model.state_dict())
+            counter = 0
+        else:
+            counter += 1
+            
+        return best_score, best_state, counter
+
+    def _inspect_model(self, model, X_eval, y_eval):
+        # Set into evaluation mode
+        model.eval()
+        X_eval = X_eval.detach().requires_grad_(True)
+        model.zero_grad()
+
+        # Forward pass
+        preds = model(X_eval)
+        eval_loss = self.loss_func(preds, y_eval)
+
+        eval_loss.backward(retain_graph = True)
+
+        # Calculate derivative of loss with respect to inputs
+        input_gradients = X_eval.grad.detach().numpy()
+        abs_gradients = np.abs(input_gradients)
+
+        normalized_sensitivity = (
+            abs_gradients / (np.max(abs_gradients, axis=1, keepdims=True) + 1e-8)
+        )
+        loss_sensitivity = np.mean(normalized_sensitivity, axis=0)
+
+        # Calculate derivatives of each target with respect to inputs
+        target_sensitivities = {}
+
+        for output_idx in range(preds.shape[1]):
+            output_gradients = torch.autograd.grad(
+                preds[:, output_idx].sum(), X_eval, retain_graph=True, create_graph = False
+            )[0]
+            avg_abs_output_gradients = np.mean(np.abs(output_gradients.detach().cpu().numpy()), axis=0)
+
+            target_sensitivities[output_idx] = avg_abs_output_gradients
+
+        model.zero_grad()
+
+        return {"training_loss_sensitivity": loss_sensitivity, "training_target_sensitivities": target_sensitivities}
+    
+    def _get_model_diagnostics(self, model, X_eval, y_eval):
+        # Set into evaluation mode
+        model.eval()
+        model.zero_grad()
+
+        # Forward pass
+        preds = model(X_eval)
+        eval_loss = self.loss_func(preds, y_eval)
+
+        # Calculate derivatives
+        eval_loss.backward()
+
+        # Create diagnostics dictionary to store gradient statistics and NaN/inf checks
+        diagnostics = {
+            "gradient_mean_per_layer": {},
+            "gradient_std_per_layer": {},
+            "gradient_max_per_layer": {},
+            "gradient_min_per_layer": {},
+            "gradient_norm_per_layer": {},
+            "global_gradient_norm": None,
+            "nan_gradients_per_layer": {},
+            "inf_gradients_per_layer": {},
+            "nan_gradients_global": None,
+            "inf_gradients_global": None,
+        }
+
+        # Get gradient statistics for each layer
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach().numpy()
+                diagnostics["gradient_mean_per_layer"][name] = np.mean(grad)
+                diagnostics["gradient_std_per_layer"][name] = np.std(grad)
+                diagnostics["gradient_max_per_layer"][name] = np.max(grad)
+                diagnostics["gradient_min_per_layer"][name] = np.min(grad)
+                diagnostics["gradient_norm_per_layer"][name] = np.linalg.norm(grad)
+
+        # Get global gradient norm
+        grad_list = [param.grad.detach().numpy().flatten() for param in model.parameters() if param.grad is not None]
+        all_grads = np.concatenate(grad_list) if grad_list else np.array([])
+        if all_grads.size:
+            diagnostics["global_gradient_norm"] = np.linalg.norm(all_grads)
+
+        # Get NaN and inf checks for gradients
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach().numpy()
+                diagnostics["nan_gradients_per_layer"][name] = np.isnan(grad).any()
+                diagnostics["inf_gradients_per_layer"][name] = np.isinf(grad).any()
+
+        diagnostics["nan_gradients_global"] = (
+            bool(np.isnan(all_grads).any()) if all_grads.size else None
+        )
+        diagnostics["inf_gradients_global"] = (
+            bool(np.isinf(all_grads).any()) if all_grads.size else None
+        )
+
+        # Reset gradients to avoid affecting subsequent computations
+        model.zero_grad()
+        
+        return diagnostics
+    
+    def _check_predict_params(
+        self,
+        X
+    ):
+        # X 
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame.")
+        if not isinstance(X.index, pd.MultiIndex):
+            raise ValueError("X must be multi-indexed.")
+        if not X.index.get_level_values(0).dtype == "object":
+            raise TypeError("The outer index of X must be strings.")
+        if not X.index.get_level_values(1).dtype == "datetime64[ns]":
+            raise TypeError("The inner index of X must be datetime.date.")
+        if not X.apply(lambda x: pd.api.types.is_numeric_dtype(x)).all():
+            raise TypeError("All columns in X must be numeric.")
+        if X.isnull().values.any():
+            raise ValueError("X must not contain missing values.")
+    
+    def _check_init_params(
+        self,
+        n_latent,
+        fit_encoder_intercept,
+        fit_head_intercept,
+        encoder_activation,
+        head_activation,
+        signal_modifier,
+        head_rank,
+        dropout_p,
+        normalization,
+        torch_model,
+        loss_func,
+        optimizer,
+        scheduler,
+        batch_size,
+        learning_rate,
+        weight_decay,
+        reg_turnover,
+        use_ts_sampler,
+        aggregate_last,
+        drop_last,
+        epochs,
+        patience,
+        train_splitter,
+        x_scaler,
+        y_scaler,
+        refit,
+        verbose,
+        random_state,
+        inverse_transform_preds,
+        min_samples,
+    ):
+        # First check either torch_model is set or (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation) are set.
+        if torch_model is None:
+            if n_latent is None or fit_encoder_intercept is None or fit_head_intercept is None or encoder_activation is None or head_activation is None:
+                raise ValueError(
+                    "When torch_model is not provided, (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation) must all be specified."
+                )
+        else:
+            if n_latent is not None or fit_encoder_intercept is not None or fit_head_intercept is not None or encoder_activation is not None or head_activation is not None or signal_modifier is not None or dropout_p is not None or normalization is not None or head_rank is not None:
+                raise ValueError(
+                    "When torch_model is provided, (n_latent, fit_encoder_intercept, fit_head_intercept, encoder_activation, head_activation, signal_modifier, dropout_p, normalization, head_rank) should be set to None."
+                )
+            
+        if torch_model is None:
+            # n_latent
+            if not isinstance(n_latent, numbers.Integral):
+                if not isinstance(n_latent, list):
+                    raise TypeError("n_latent must be either an integer or a list of integers.")
+                if not all(isinstance(x, numbers.Integral) for x in n_latent):
+                    raise TypeError("When n_latent is a list, all elements must be integers.")
+                if len(n_latent) <= 1:
+                    raise ValueError("When n_latent is a list, it must contain more than one element.")
+                if not all(x >= 1 for x in n_latent):
+                    raise ValueError("When n_latent is a list, all elements must be at least 1.")
+            else:
+                if n_latent < 1:
+                    raise ValueError("When n_latent is an integer, it must be at least 1.")
+            
+            # fit_encoder_intercept
+            if not isinstance(fit_encoder_intercept, bool):
+                raise TypeError("fit_encoder_intercept must be a boolean.")
+        
+            # fit_head_intercept
+            if not isinstance(fit_head_intercept, bool):
+                raise TypeError("fit_head_intercept must be a boolean.")
+        
+            # encoder_activation
+            if not isinstance(encoder_activation, str):
+                raise TypeError("encoder_activation must be a string.")
+            if encoder_activation not in {"tanh", "relu", "sigmoid", "gelu", "silu"}:
+                raise ValueError(
+                    "encoder_activation must be one of 'tanh', 'relu', 'sigmoid', 'gelu', or 'silu'."
+                )
+        
+            # head_activation
+            if not isinstance(head_activation, str):
+                raise TypeError("head_activation must be a string.")
+            if head_activation not in {"tanh", "relu", "sigmoid", "identity"}:
+                raise ValueError(
+                    "head_activation must be one of 'tanh', 'relu', 'sigmoid', or 'identity'."
+                )
+
+            # signal_modifier 
+            if signal_modifier is not None:
+                if not isinstance(signal_modifier, nn.Module):
+                    raise TypeError("signal_modifier must be an instance of torch.nn.Module or None.")
+                # this will be the final layer in a neural net so associated checks that it can be used are needed
+                if not hasattr(signal_modifier, "forward"):
+                    raise ValueError("signal_modifier must have a forward method.")
+                if not callable(signal_modifier.forward):
+                    raise ValueError("signal_modifier.forward must be callable.")
+
+            # head_rank
+            if head_rank is not None:
+                if not isinstance(head_rank, int):
+                    raise TypeError("head_rank must be an integer.")
+                if head_rank <= 0:
+                    raise ValueError("head_rank must be a positive integer.")
+
+            # dropout_p
+            if dropout_p is not None:
+                if not isinstance(dropout_p, (numbers.Real, list)):
+                    raise TypeError("dropout_p must be a real number or a list.")
+                if isinstance(dropout_p, numbers.Real):
+                    if not (0 <= dropout_p < 1):
+                        raise ValueError("dropout_p must be between 0 and 1.")
+                else:
+                    if len(dropout_p) == 0:
+                        raise ValueError("dropout_p list must not be empty.")
+                    if type(n_latent) is not list:
+                        raise TypeError("n_latent must be a list when dropout_p is a list.")
+                    if len(dropout_p) != len(n_latent):
+                        raise ValueError("dropout_p list must have the same length as n_latent list.")
+                    for p in dropout_p:
+                        if not isinstance(p, numbers.Real):
+                            raise TypeError("Each element in dropout_p list must be a real number.")
+                        if not (0 <= p < 1):
+                            raise ValueError("Each element in dropout_p list must be between 0 (inclusive) and 1 (exclusive).")
+        
+            # normalization
+            if normalization is not None:
+                if not isinstance(normalization, str):
+                    raise TypeError("normalization must be a string.")
+                if normalization not in {"batch", "layer"}:
+                    raise ValueError("normalization must be one of 'batch' or 'layer'.")
+        
+        # torch_model
+        if torch_model is not None:
+            if not isinstance(torch_model, nn.Module):
+                raise TypeError("torch_model must be an instance of torch.nn.Module or None.")
+            if not isinstance(torch_model, BaseEstimator):
+                raise TypeError(
+                    "torch_model must be an instance of a class inheriting from" \
+                    "sklearn.base.BaseEstimator. This is to allow for cross-validation" \
+                    "on model hyperparameters in a `scikit-learn` framework."
+                )
+            # it needs a forward method
+            if type(torch_model).forward is nn.Module.forward:
+                raise ValueError("torch_model must have a forward method.")
+            # it needs an encoder module
+            if not hasattr(torch_model, "encoder"):
+                raise ValueError("torch_model must have an 'encoder' moduleattribute.")
+            # it needs a head module
+            if not hasattr(torch_model, "head"):
+                raise ValueError("torch_model must have a 'head' module attribute.")
+
+        # loss_func
+        if not isinstance(loss_func, nn.Module):
+            raise TypeError("loss_func must inherit from nn.Module.")
+        try:
+            test_loss = loss_func(torch.rand(16,1), torch.rand(16,1))
+        except Exception as e:
+            raise ValueError(f"loss_func must be callable with signature loss_func(preds, targets). Error encountered when testing random preds and targets of batch size 16 and single outputs: {e}")
+        
+        # optimizer
+        if not isinstance(optimizer, str):
+            if not isinstance(optimizer, list):
+                raise TypeError("optimizer must be either a string or a list of strings.")
+            else:
+                if len(optimizer) <= 1:
+                    raise ValueError("When optimizer is a list, it must contain more than one element.")
+                if not all(isinstance(x, str) for x in optimizer):
+                    raise TypeError("When optimizer is a list, all elements must be strings.")
+                if not all(x in {"AdamW", "SGD", "SGD+mom", "Adam"} for x in optimizer):
+                    raise ValueError("When optimizer is a list, all elements must be one of 'AdamW', 'SGD', 'Adam', or 'SGD+mom'.")
+        else:
+            if optimizer not in {"AdamW", "SGD", "SGD+mom", "Adam"}:
+                raise ValueError("optimizer must be one of 'AdamW', 'SGD', 'Adam', or 'SGD+mom'.")
+        
+        # scheduler
+        if scheduler is not None:
+            if not isinstance(scheduler, str):
+                raise TypeError("scheduler must be a string or None.")
+            if scheduler not in {"OneCycleLR"}:
+                raise ValueError("scheduler must be one of 'OneCycleLR' or None.")
+            
+        # batch_size
+        if not isinstance(batch_size, numbers.Integral):
+            raise TypeError("batch_size must be an integer.")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1.")
+        
+        # learning_rate
+        if not isinstance(learning_rate, numbers.Real):
+            raise TypeError("learning_rate must be a real number.")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be positive.")
+
+        # weight_decay
+        if not isinstance(weight_decay, numbers.Real):
+            raise TypeError("weight_decay must be a real number.")
+        if weight_decay < 0:
+            raise ValueError("weight_decay must be non-negative.")
+        
+        # reg_turnover
+        if not isinstance(reg_turnover, numbers.Real):
+            raise TypeError("reg_turnover must be a real number.")
+        if reg_turnover < 0:
+            raise ValueError("reg_turnover must be non-negative.")
+        
+        # use_ts_sampler
+        if not isinstance(use_ts_sampler, bool):
+            raise TypeError("use_ts_sampler must be a boolean.")
+        
+        # aggregate_last
+        if not isinstance(aggregate_last, bool):
+            raise TypeError("aggregate_last must be a boolean.")
+        
+        # drop_last
+        if not isinstance(drop_last, bool):
+            raise TypeError("drop_last must be a boolean.")
+        if aggregate_last and drop_last:
+            raise ValueError("aggregate_last and drop_last cannot both be True.")
+        
+        # epochs
+        if not isinstance(epochs, numbers.Integral):
+            raise TypeError("epochs must be an integer.")
+        if epochs < 1:
+            raise ValueError("epochs must be at least 1.")
+        
+        # patience
+        if patience is not None:
+            if not isinstance(patience, numbers.Integral):
+                raise TypeError("patience must be an integer.")
+            if patience < 1:
+                raise ValueError("patience must be at least 1.")
+        
+        # train_splitter
+        if not isinstance(train_splitter, (numbers.Real, BaseCrossValidator)):
+            raise TypeError("train_splitter must be either a real number or an instance of BaseCrossValidator from scikit-learn.")
+        if isinstance(train_splitter, numbers.Real):
+            if not (0 < train_splitter < 1):
+                raise ValueError("train_splitter must be between 0 and 1.")
+
+        # x_scaler
+        if x_scaler is not None:
+            if not isinstance(x_scaler, StandardScaler):
+                raise TypeError("x_scaler must be an instance of StandardScaler or None.")
+        
+        # y_scaler
+        if y_scaler is not None:
+            if not isinstance(y_scaler, StandardScaler):
+                raise TypeError("y_scaler must be an instance of StandardScaler or None.")
+            
+        # refit 
+        if not isinstance(refit, bool):
+            raise TypeError("refit must be a boolean.")
+
+        # verbose
+        if not isinstance(verbose, bool):
+            raise TypeError("verbose must be a boolean.")
+        
+        # random_state
+        if not isinstance(random_state, numbers.Integral):
+            if not isinstance(random_state, list):
+                raise TypeError("random_state must be either an integer or a list of integers.")
+            else:
+                if not all(isinstance(x, numbers.Integral) for x in random_state):
+                    raise TypeError("When random_state is a list, all elements must be integers.")
+                if not all(x >= 0 for x in random_state):
+                    raise ValueError("When random_state is a list, all elements must be non-negative.")
+                if len(random_state) <= 1:
+                    raise ValueError("When random_state is a list, it must contain more than one element.")
+        else:     
+            if random_state < 0:
+                raise ValueError("When random_state is an integer, it must be non-negative.")
+        
+        # inverse_transform_preds
+        if not isinstance(inverse_transform_preds, bool):
+            raise TypeError("inverse_transform_preds must be a boolean.")
+        
+        # min_samples
+        if not isinstance(min_samples, numbers.Integral):
+            raise TypeError("min_samples must be an integer.")
+        if min_samples < 1:
+            raise ValueError("min_samples must be at least 1.")
+        
+    def _check_fit_params(self, X, y):
+        # X 
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("X must be a pandas DataFrame.")
+        if not isinstance(X.index, pd.MultiIndex):
+            raise ValueError("X must be multi-indexed.")
+        if not X.index.get_level_values(0).dtype == "object":
+            raise TypeError("The outer index of X must be strings.")
+        if not X.index.get_level_values(1).dtype == "datetime64[ns]":
+            raise TypeError("The inner index of X must be datetime.date.")
+        if not X.apply(lambda x: pd.api.types.is_numeric_dtype(x)).all():
+            raise TypeError("All columns in X must be numeric.")
+        if X.isnull().values.any():
+            raise ValueError("X must not contain missing values.")
+        
+        # y 
+        if not (isinstance(y, pd.Series) or isinstance(y, pd.DataFrame)):
+            raise TypeError(
+                "y must be a pandas Series or DataFrame."
+            )
+        if not isinstance(y.index, pd.MultiIndex):
+            raise ValueError("y must be multi-indexed.")
+        if not y.index.get_level_values(0).dtype == "object":
+            raise TypeError("The outer index of y must be strings.")
+        if not y.index.get_level_values(1).dtype == "datetime64[ns]":
+            raise TypeError("The inner index of y must be datetime.date.")
+        if not X.index.equals(y.index):
+            raise ValueError("X and y must have the same multi-index.")
+
+if __name__ == "__main__":
+    from macrosynergy.learning import (
+        SignalOptimizer,
+        NegSharpeRatio,
+        RollingKFoldPanelSplit,
+    )
+    from macrosynergy.management.simulate import make_qdf
+    import pandas as pd
+    import numpy as np
+
+    from sklearn.base import BaseEstimator
+
+    cids = ["AUD", "CAD", "GBP", "USD"]
+    xcats = ["XR1", "CRY", "GROWTH", "RATES", "XR2"]
+    cols = ["earliest", "latest", "mean_add", "sd_mult", "ar_coef", "back_coef"]
+
+    df_cids = pd.DataFrame(
+        index=cids, columns=["earliest", "latest", "mean_add", "sd_mult"]
+    )
+    df_cids.loc["AUD"] = ["2012-01-01", "2020-12-31", 0, 1]
+    df_cids.loc["CAD"] = ["2012-01-01", "2020-12-31", 0, 1]
+    df_cids.loc["GBP"] = ["2012-01-01", "2020-12-31", 0, 1]
+    df_cids.loc["USD"] = ["2012-01-01", "2020-12-31", 0, 1]
+
+    df_xcats = pd.DataFrame(index=xcats, columns=cols)
+    df_xcats.loc["XR1"] = ["2012-01-01", "2020-12-31", 0.1, 1, 0, 0.3]
+    df_xcats.loc["CRY"] = ["2012-01-01", "2020-12-31", 1, 2, 0.95, 1]
+    df_xcats.loc["GROWTH"] = ["2012-01-01", "2020-12-31", 1, 2, 0.9, 1]
+    df_xcats.loc["RATES"] = ["2010-01-01", "2020-12-31", 0, 1, 0.5, 0.5]
+    df_xcats.loc["XR2"] = ["2020-01-01", "2020-12-31", -0.1, 2, 0.8, 0.3]
+
+    dfd = make_qdf(df_cids, df_xcats, back_ar=0.75, seed = 42)
+    dfd["grading"] = np.ones(dfd.shape[0])
+    black = {
+        "GBP": (
+            pd.Timestamp(year=2009, month=1, day=1),
+            pd.Timestamp(year=2012, month=6, day=30),
+        ),
+        "CAD": (
+            pd.Timestamp(year=2015, month=1, day=1),
+            pd.Timestamp(year=2016, month=1, day=1),
+        ),
+    }
+
+    so = SignalOptimizer(
+        df=dfd,
+        xcats=["CRY", "GROWTH", "RATES", "XR1", "XR2"],
+        cids=["USD"],
+        blacklist=black,
+        drop_nas="X",
+        n_targets=2,
+    )
+    X = so.X.copy(deep=True)
+    y = so.y.copy(deep=True)
+
+    # class BasicMLP(nn.Module, BaseEstimator):
+    #     def __init__(self, n_inputs, n_latent, n_outputs, dropout=0.1):
+    #         super().__init__()
+    #         self.n_inputs = n_inputs
+    #         self.n_latent = n_latent
+    #         self.n_outputs = n_outputs
+    #         self.dropout = dropout
+
+    #         self.encoder = nn.Linear(n_inputs, n_latent)
+    #         self.dropout_layer = nn.Dropout(dropout)
+    #         self.head = nn.Linear(n_latent, n_outputs)
+
+    #     def forward(self, x):
+    #         z = torch.tanh(self.encoder(x))
+    #         z = self.dropout_layer(z)
+    #         out = self.head(z)
+    #         return out
+
+    mlp = MLPRegressor(
+        n_latent = [64,32], 
+        fit_encoder_intercept = True,
+        fit_head_intercept = True,
+        encoder_activation = "tanh",
+        head_activation="identity",
+        dropout_p = 0.1,
+        signal_modifier=nn.Softmax(dim=1),
+        normalization = "layer",
+        #torch_model = BasicMLP(n_inputs=X.shape[1], n_latent=16, n_outputs=y.shape[1]),
+        loss_func=NegSharpeRatio(),
+        optimizer = "AdamW",
+        scheduler = None, 
+        batch_size = 16,
+        learning_rate = 3e-4, 
+        weight_decay = 1e-4,
+        reg_turnover = 1e-4,
+        use_ts_sampler = True,
+        aggregate_last=True,
+        drop_last=False,
+        epochs = 100,
+        patience = 10, 
+        refit = False,
+        train_splitter=RollingKFoldPanelSplit(n_splits=5),
+        x_scaler = None,
+        y_scaler = None,
+        #refit=False,
+        ##train_pct = 0.7,
+        #x_scaler = StandardScaler(with_mean=False),
+        #y_scaler = StandardScaler(with_mean=False),
+        #verbose = False, 
+        random_state = 42,
+        inverse_transform_preds = False,
+        min_samples = 36,
+    ).fit(X,y)
+    print(mlp.early_stopping_dynamics[(0,0)])
+    print(mlp.early_stopping_inference[(0,0)])
+    print(mlp.predict(X))
+
+    # so.calculate_predictions(
+    #     name = "MLP",
+    #     models = {
+    #         "MLP": mlp
+    #     },
+    #     multi_target_fill="mean",
+    #     min_cids = 1,
+    #     min_xcats = 1,
+    #     min_periods = 36,
+    # )
+
+    # dfa = so.get_optimized_signals()
+    # print(dfa)
+
+    # print(list(mlp.models[0].parameters()))
+    # print(list(mlp.models[1].parameters()))
+    # preds = mlp.predict(X)
+    # print(preds)

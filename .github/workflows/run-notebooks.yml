@@ -1,0 +1,54 @@
+name: Run Notebooks
+
+on:
+  workflow_dispatch:
+
+  # pull_request:
+  #   branches:
+  #     - main
+
+permissions:
+  id-token: write # This is required for aws oidc connection
+  contents: read # This is required for actions/checkout
+  pull-requests: write # This is required for gh bot to comment PR
+
+env:
+  TF_LOG: INFO
+  AWS_REGION: eu-west-2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.12
+
+      - name: Install dependencies
+        run: |
+          pip install boto3
+
+      - name: Configure AWS credentials from AWS account
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }}
+          aws-region: eu-west-2
+          role-session-name: GitHub-OIDC-TERRAFORM
+          role-duration-seconds: 7200 # 2 Hours, role is set so can be max 4 hours
+
+      - name: Run notebook script
+        run: |
+          python .github/scripts/run_notebooks.py
+        env: 
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          AWS_BUCKET_NAME: ${{ secrets.AWS_NOTEBOOK_BUCKET }}
+          ECR_IMAGE: ${{ secrets.ECR_IMAGE }}
+          ECS_CLUSTER_NAME: ${{ secrets.ECS_CLUSTER_NAME }}
+          SUBNET_IDS: ${{ secrets.SUBNET_IDS }}
+          EXECUTION_ROLE_ARN: ${{ secrets.EXECUTION_ROLE_ARN }} 
+

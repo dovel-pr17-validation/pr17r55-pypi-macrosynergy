@@ -1,0 +1,719 @@
+"""Test historical volatility estimates with simulate returns from random normal distribution"""
+
+import unittest
+import unittest.mock
+import matplotlib.pyplot
+import pandas as pd
+import numpy as np
+import matplotlib
+import warnings
+
+from typing import List
+from numbers import Number
+
+from macrosynergy.download.transaction_costs import (
+    AVAIALBLE_COSTS,
+    AVAILABLE_STATS,
+    AVAILABLE_CTYPES,
+    AVAILABLE_CATS,
+    download_transaction_costs,
+)
+from macrosynergy.pnl.transaction_costs import (
+    get_fids,
+    check_df_for_txn_stats,
+    get_diff_index,
+    extrapolate_cost,
+    _plot_costs_func,
+    SparseCosts,
+    TransactionCosts,
+    TransactionCostsDictAdapter,
+)
+
+from macrosynergy.management.utils import qdf_to_ticker_df
+from macrosynergy.management.types import QuantamentalDataFrame
+from macrosynergy.compat import PD_2_0_OR_LATER
+
+KNOWN_FID_ENDINGS = [f"{t}_{s}" for t in AVAIALBLE_COSTS for s in AVAILABLE_STATS]
+
+
+def make_tx_cost_df(
+    cids: List[str] = None,
+    tickers: List[str] = None,
+    start="2015-01-01",
+    end="2020-01-01",
+) -> pd.DataFrame:
+    err = "Either cids or tickers must be provided (not both)"
+    assert bool(cids) or bool(tickers), err
+    assert bool(cids) ^ bool(tickers), err
+
+    if cids is None:
+        tiks = tickers
+    else:
+        tiks = [f"{c}_{k}" for c in cids for k in AVAILABLE_CATS]
+
+    date_range = pd.bdate_range(start=start, end=end)
+    date_batches = [date_range[i : i + 30] for i in range(0, len(date_range), 30)]
+
+    dataframes = [
+        pd.DataFrame(
+            data=abs(float(np.random.rand())),
+            index=date_batch,
+            columns=["value"],
+        )
+        .reset_index()
+        .rename(columns={"index": "real_date"})
+        for date_batch in date_batches
+    ]
+
+    outs = []
+    for tik in tiks:
+        cid, xcat = tik.split("_", 1)
+        out_df = (
+            pd.concat(dataframes, axis=0)
+            .reset_index(drop=True)
+            .assign(cid=cid, xcat=xcat)
+        )
+        out_df["value"] = out_df["value"] * np.random.randint(1, 100)
+        outs.append(out_df)
+
+    return QuantamentalDataFrame.from_qdf_list(outs, categorical=False)
+
+
+def benchmark_extrapolate_cost(
+    trade_size: float,
+    median_size: float,
+    median_cost: float,
+    pct90_size: float,
+    pct90_cost: float,
+) -> float:
+    err_msg = "`{k}` must be a number > 0"
+    if not isinstance(trade_size, Number):
+        raise TypeError(err_msg.format(k="trade_size"))
+    trade_size = abs(trade_size)
+
+    for k, v in [
+        ("trade_size", trade_size),
+        ("median_size", median_size),
+        ("median_cost", median_cost),
+        ("pct90_size", pct90_size),
+        ("pct90_cost", pct90_cost),
+    ]:
+        if not isinstance(v, Number):
+            raise TypeError(err_msg.format(k=k))
+        if v < 0:
+            raise ValueError(err_msg.format(k=k))
+
+    if trade_size <= median_size:
+        cost = median_cost
+    else:
+        b = (pct90_cost - median_cost) / (pct90_size - median_size)
+        cost = median_cost + b * (trade_size - median_size)
+    return cost
+
+
+class TestFunctions(unittest.TestCase):
+    def setUp(self):
+        cids = ["USD", "EUR", "JPY", "GBP", "AUD", "CAD"]
+        tiks = [f"{c}_{k}" for c in cids for k in AVAILABLE_CATS]
+        self.cids = cids
+        self.fids = [f"{c}_{ct}" for c in cids for ct in AVAILABLE_CTYPES]
+        self.df = make_tx_cost_df(tickers=tiks)
+        self.dfw = QuantamentalDataFrame(self.df).to_wide()
+        self.change_index = get_diff_index(self.dfw)
+        self.tcost_n: str = "BIDOFFER_MEDIAN"
+        self.rcost_n: str = "ROLLCOST_MEDIAN"
+        self.size_n: str = "SIZE_MEDIAN"
+        self.tcost_l: str = "BIDOFFER_90PCTL"
+        self.rcost_l: str = "ROLLCOST_90PCTL"
+        self.size_l: str = "SIZE_90PCTL"
+
+    def test_get_fids(self):
+        fids = get_fids(self.df)
+        self.assertTrue(all([fid in fids for fid in self.fids]))
+
+    def test_check_df_for_txn_stats(self):
+        check_df_for_txn_stats(
+            self.df,
+            fids=self.fids,
+            tcost_n=self.tcost_n,
+            tcost_l=self.tcost_l,
+            rcost_n=self.rcost_n,
+            rcost_l=self.rcost_l,
+            size_n=self.size_n,
+            size_l=self.size_l,
+        )
+
+        # check invalid fid
+        inv_fid = "USD_FX_BIDOFFER_MEDIAN"
+        with self.assertRaises(ValueError):
+            check_df_for_txn_stats(
+                self.df,
+                fids=self.fids + [inv_fid],
+                tcost_n=self.tcost_n,
+                tcost_l=self.tcost_l,
+                rcost_n=self.rcost_n,
+                rcost_l=self.rcost_l,
+                size_n=self.size_n,
+                size_l=self.size_l,
+            )
+
+    def test_get_diff_index(self):
+        change_index = get_diff_index(self.dfw)
+        self.assertTrue(len(change_index) < len(self.dfw.index))
+        df_diff = self.dfw.diff(axis=0)
+        chg_idx = df_diff.index[((df_diff.abs() > 0) | df_diff.isnull()).any(axis=1)]
+        self.assertTrue((change_index == chg_idx).all())
+
+    def test_extrapolate_cost(self):
+        good_args = {
+            "trade_size": 1e7,  # 10mil
+            "median_size": 3e6,  # 3mil
+            "median_cost": 5e4,  # 50k
+            "pct90_size": 1.5e7,  # 15mil
+            "pct90_cost": 1e5,  # 100k
+        }
+
+        # test with good args
+        cost = extrapolate_cost(**good_args)
+        assert isinstance(cost, Number)
+        cost = good_args["median_cost"] + (
+            good_args["trade_size"] - good_args["median_size"]
+        ) * (good_args["pct90_cost"] - good_args["median_cost"]) / (
+            good_args["pct90_size"] - good_args["median_size"]
+        )
+        self.assertAlmostEqual(cost, extrapolate_cost(**good_args))
+
+        # test with negative trade size, result should be the same
+        bad_args = good_args.copy()
+        bad_args["trade_size"] = bad_args["trade_size"] * -1
+        self.assertAlmostEqual(cost, extrapolate_cost(**bad_args))
+
+        # test with bad args
+        for k in good_args:
+            bad_args = good_args.copy()
+            bad_args[k] = "a"
+            with self.assertRaises(TypeError):
+                extrapolate_cost(**bad_args)
+            if k == "trade_size":
+                continue
+            bad_args[k] = -1
+            with self.assertRaises(ValueError):
+                extrapolate_cost(**bad_args)
+
+        # try with trade size less than median size
+        good_args["trade_size"] = 1e6
+        self.assertEqual(good_args["median_cost"], extrapolate_cost(**good_args))
+
+    def test_benchmark_extrapolate_cost(self):
+        for _ in range(100):
+            trade_size = np.random.randint(1, 1e7)
+            median_size = np.random.randint(1, 1e7)
+            median_cost = np.random.randint(1, 1e7)
+            pct90_size = np.random.randint(1, 1e7)
+            pct90_cost = np.random.randint(1, 1e7)
+
+            result = benchmark_extrapolate_cost(
+                trade_size=trade_size,
+                median_size=median_size,
+                median_cost=median_cost,
+                pct90_size=pct90_size,
+                pct90_cost=pct90_cost,
+            )
+
+            expected_result = extrapolate_cost(
+                trade_size=trade_size,
+                median_size=median_size,
+                median_cost=median_cost,
+                pct90_size=pct90_size,
+                pct90_cost=pct90_cost,
+            )
+
+            self.assertAlmostEqual(expected_result, result)
+
+
+class TestSparseCosts(unittest.TestCase):
+    def setUp(self):
+        self.cids = ["USD", "EUR", "JPY", "GBP", "AUD", "CAD"]
+        self.tiks = [f"{c}_{k}" for c in self.cids for k in AVAILABLE_CATS]
+        self.fids = [f"{c}_{ct}" for c in self.cids for ct in AVAILABLE_CTYPES]
+        self.df = make_tx_cost_df(tickers=self.tiks)
+        self.dt_range = pd.bdate_range(
+            self.df["real_date"].min(), self.df["real_date"].max()
+        )
+
+    def test_init(self):
+        sc = SparseCosts(self.df)
+        self.assertTrue(all([fid in sc._all_fids for fid in self.fids]))
+        self.assertTrue(set(self.tiks) == set(sc.df_wide.columns))
+
+        self.assertRaises(TypeError, SparseCosts, qdf_to_ticker_df(self.df))
+
+    def test_get_costs(self):
+        sc = SparseCosts(self.df)
+        for _ in range(10):
+            rd = np.random.choice(self.dt_range)
+            fid = np.random.choice(self.fids)
+            result = sc.get_costs(fid, rd)
+            self.assertIsInstance(result, pd.Series)
+
+            tiks_with_fid = [tik for tik in self.tiks if tik.startswith(fid)]
+            self.assertEqual(set(result.index.tolist()), set(tiks_with_fid))
+
+            expected_df = sc.df_wide.loc[sc.df_wide.index <= rd, tiks_with_fid]
+            last_valid_index = expected_df.last_valid_index()
+            expected_result = expected_df.loc[last_valid_index]
+            self.assertTrue(expected_result.equals(result))
+
+        # test with invalid fid
+        inv_fid = "AUD_RANDOM"
+        result = sc.get_costs(inv_fid, rd)
+        self.assertIsNone(result)
+
+        test_sc = SparseCosts(self.df)
+        # drop one fid
+        sel_fid = test_sc._all_fids[0]
+        test_sc._all_fids = test_sc._all_fids[1:]
+        for icol in list(test_sc.df_wide.columns):
+            if icol.startswith(sel_fid):
+                test_sc.df_wide.drop(columns=icol, inplace=True)
+
+        # test with missing fid
+        result = test_sc.get_costs(sel_fid, rd)
+        self.assertIsNone(result)
+
+        # test with 2021 date, should return last valid date
+        fid = np.random.choice(self.fids)
+        rd = "2021-01-01"
+        result = sc.get_costs(fid, rd)
+
+        tiks_with_fid = [tik for tik in self.tiks if tik.startswith(fid)]
+        self.assertEqual(set(result.index.tolist()), set(tiks_with_fid))
+
+        expected_df = sc.df_wide.loc[sc.df_wide.index <= rd, tiks_with_fid]
+        last_valid_index = expected_df.last_valid_index()
+        expected_result = expected_df.loc[last_valid_index]
+
+        self.assertTrue(expected_result.equals(result))
+
+
+class TestTransactionCosts(unittest.TestCase):
+    def setUp(self):
+        self.cids = ["USD", "EUR", "JPY", "GBP", "AUD", "CAD"]
+        self.tiks = [f"{c}_{k}" for c in self.cids for k in AVAILABLE_CATS]
+        self.fids = [f"{c}_{ct}" for c in self.cids for ct in AVAILABLE_CTYPES]
+        self.df = make_tx_cost_df(tickers=self.tiks)
+        self.dt_range = pd.bdate_range(
+            self.df["real_date"].min(), self.df["real_date"].max()
+        )
+
+    def test_init(self):
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+
+        self.assertTrue(tc.change_index.equals(tc.sparse_costs.change_index))
+        self.assertTrue(tc.df_wide.equals(tc.sparse_costs.df_wide))
+        self.assertTrue(tc.qdf.equals(tc.sparse_costs.df))
+
+    def test_download(self):
+        with unittest.mock.patch(
+            "macrosynergy.pnl.transaction_costs.download_transaction_costs",
+            return_value=self.df,
+        ):
+            tc = TransactionCosts.download()
+            if PD_2_0_OR_LATER:
+                self.assertTrue(tc.qdf.eq(self.df).all().all())
+            else:
+                self.assertTrue(
+                    pd.DataFrame(tc.qdf).eq(pd.DataFrame(self.df)).all().all()
+                )
+
+    def test_from_qdf(self):
+        tc = TransactionCosts.from_qdf(self.df, fids=self.fids)
+        if PD_2_0_OR_LATER:
+            self.assertTrue(tc.qdf.eq(self.df).all().all())
+        else:
+            self.assertTrue(pd.DataFrame(tc.qdf).eq(pd.DataFrame(self.df)).all().all())
+
+    def test_get_costs(self):
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+        for _ in range(10):
+            rd = np.random.choice(self.dt_range)
+            fid = np.random.choice(self.fids)
+            result = tc.get_costs(fid, rd)
+            expected_result = tc.sparse_costs.get_costs(fid, rd)
+            self.assertTrue(expected_result.equals(result))
+
+        # test with invalid fid
+        inv_fid = "AUD_RANDOM"
+        self.assertIsNone(tc.get_costs(inv_fid, rd))
+
+    def test_extrapolate_cost(self):
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+
+        for _ in range(100):
+            trade_size = np.random.randint(1, 1e7)
+            median_size = np.random.randint(1, 1e7)
+            median_cost = np.random.randint(1, 1e7)
+            pct90_size = np.random.randint(1, 1e7)
+            pct90_cost = np.random.randint(1, 1e7)
+
+            result = tc.extrapolate_cost(
+                trade_size=trade_size,
+                median_size=median_size,
+                median_cost=median_cost,
+                pct90_size=pct90_size,
+                pct90_cost=pct90_cost,
+            )
+
+            expected_result = extrapolate_cost(
+                trade_size=trade_size,
+                median_size=median_size,
+                median_cost=median_cost,
+                pct90_size=pct90_size,
+                pct90_cost=pct90_cost,
+            )
+
+            if np.isnan(expected_result):
+                self.assertTrue(np.isnan(result))
+            else:
+                self.assertAlmostEqual(expected_result, result)
+
+        self.assertEqual(tc.extrapolate_cost(None, 1, 1, 1, 1), 0)
+
+    def test_bidoffer(self):
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+        # mock the tc.sparse_costs.get_costs method
+        for _ in range(100):
+            fid = np.random.choice(self.fids)
+            trade_size = np.random.randint(1, 1e7)
+            real_date = np.random.choice(self.dt_range)
+
+            result = tc.bidoffer(fid=fid, trade_size=trade_size, real_date=real_date)
+
+            rel_row = tc.sparse_costs.get_costs(fid=fid, real_date=real_date)
+            expected_result = tc.extrapolate_cost(
+                trade_size=trade_size,
+                median_size=rel_row[fid + tc.size_n],
+                median_cost=rel_row[fid + tc.tcost_n],
+                pct90_size=rel_row[fid + tc.size_l],
+                pct90_cost=rel_row[fid + tc.tcost_l],
+            )
+            if np.isnan(expected_result):
+                self.assertTrue(np.isnan(result))
+            else:
+                self.assertAlmostEqual(expected_result, result)
+
+    def test_rollcost(self):
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+        for _ in range(100):
+            fid = np.random.choice(self.fids)
+            trade_size = np.random.randint(1, 1e7)
+            real_date = np.random.choice(self.dt_range)
+
+            result = tc.rollcost(fid=fid, trade_size=trade_size, real_date=real_date)
+
+            rel_row = tc.sparse_costs.get_costs(fid=fid, real_date=real_date)
+            expected_result = tc.extrapolate_cost(
+                trade_size=trade_size,
+                median_size=rel_row[fid + tc.size_n],
+                median_cost=rel_row[fid + tc.rcost_n],
+                pct90_size=rel_row[fid + tc.size_l],
+                pct90_cost=rel_row[fid + tc.rcost_l],
+            )
+            if np.isnan(expected_result):
+                self.assertTrue(np.isnan(result))
+            else:
+                self.assertAlmostEqual(expected_result, result)
+
+    def test_plot_costs_func(self):
+        matplotlib.pyplot.close("all")
+        curr_backend = matplotlib.pyplot.get_backend()
+        matplotlib.use("Agg")
+        tc = TransactionCosts(df=self.df, fids=self.fids)
+
+        good_args = {
+            "fids": self.fids[:3],
+            "cost_type": "BIDOFFER",
+            "ncol": 2,
+            "x_axis_label": "Real Date",
+            "y_axis_label": "Cost",
+            "title": "Test",
+            "title_fontsize": 28,
+            "facet_title_fontsize": 20,
+        }
+
+        with self.assertRaises(ValueError):
+            bad_args = good_args.copy()
+            bad_args["fids"] = [1, 2]
+            _plot_costs_func(tco=tc, **bad_args)
+
+        with self.assertRaises(ValueError):
+            bad_tc = TransactionCosts(df=self.df, fids=self.fids[:3])
+            bad_tc.__dict__.pop("sparse_costs")
+            _plot_costs_func(tco=bad_tc, **good_args)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _plot_costs_func(tco=tc, **good_args)
+        matplotlib.pyplot.close("all")
+        matplotlib.use(curr_backend)
+
+
+class TestDownloadTransactionCosts(unittest.TestCase):
+    def setUp(self):
+        self.cids = ["USD", "EUR"]
+        self.tiks = [f"{c}_{k}" for c in self.cids for k in AVAILABLE_CATS]
+        self.qdf = make_tx_cost_df(tickers=self.tiks)
+        # Source-shape frame the downloader expects: ticker/real_date/value
+        self.source_df = self.qdf.assign(
+            ticker=self.qdf["cid"] + "_" + self.qdf["xcat"]
+        )[["real_date", "ticker", "value"]].reset_index(drop=True)
+        self.csv_text = self.source_df.to_csv(index=False)
+
+    def _assert_matches_source(self, dfd: pd.DataFrame):
+        self.assertIsInstance(dfd, QuantamentalDataFrame)
+        self.assertEqual(
+            set(dfd.columns), set(QuantamentalDataFrame.IndexCols + ["value"])
+        )
+        self.assertEqual(len(dfd), len(self.source_df))
+
+    def test_invalid_file_url(self):
+        with self.assertRaises(ValueError):
+            download_transaction_costs(file_url=None)
+        with self.assertRaises(ValueError):
+            download_transaction_costs(file_url=123)
+
+    def test_download_csv_auto_extension(self):
+        with unittest.mock.patch(
+            "macrosynergy.download.transaction_costs._request_wrapper",
+            return_value=self.csv_text,
+        ) as mock_req:
+            dfd = download_transaction_costs(file_url="http://example.com/data.csv")
+        mock_req.assert_called_once()
+        self._assert_matches_source(dfd)
+
+    def test_download_csv_explicit_format(self):
+        # URL extension does not match; explicit file_format forces CSV path
+        with unittest.mock.patch(
+            "macrosynergy.download.transaction_costs._request_wrapper",
+            return_value=self.csv_text,
+        ) as mock_req:
+            dfd = download_transaction_costs(
+                file_url="http://example.com/data", file_format="csv"
+            )
+        mock_req.assert_called_once()
+        self._assert_matches_source(dfd)
+
+    def test_download_parquet_auto_extension(self):
+        with unittest.mock.patch(
+            "macrosynergy.download.transaction_costs.pd.read_parquet",
+            return_value=self.source_df.copy(),
+        ) as mock_pq:
+            dfd = download_transaction_costs(file_url="http://example.com/data.parquet")
+        mock_pq.assert_called_once_with("http://example.com/data.parquet")
+        self._assert_matches_source(dfd)
+
+    def test_download_parquet_explicit_format(self):
+        with unittest.mock.patch(
+            "macrosynergy.download.transaction_costs.pd.read_parquet",
+            return_value=self.source_df.copy(),
+        ) as mock_pq:
+            dfd = download_transaction_costs(
+                file_url="http://example.com/data", file_format="parquet"
+            )
+        mock_pq.assert_called_once()
+        self._assert_matches_source(dfd)
+
+    def test_unsupported_file_format(self):
+        # auto + unrecognised extension should raise
+        with self.assertRaises(ValueError):
+            download_transaction_costs(file_url="http://example.com/data.json")
+        # explicit unsupported format should raise
+        with self.assertRaises(ValueError):
+            download_transaction_costs(
+                file_url="http://example.com/data.csv", file_format="json"
+            )
+
+    def test_kwargs_forwarded_to_request(self):
+        with unittest.mock.patch(
+            "macrosynergy.download.transaction_costs._request_wrapper",
+            return_value=self.csv_text,
+        ) as mock_req:
+            download_transaction_costs(
+                file_url="http://example.com/data.csv",
+                verify=False,
+                headers={"X-Test": "1"},
+            )
+        _, kwargs = mock_req.call_args
+        self.assertEqual(kwargs.get("verify"), False)
+        self.assertEqual(kwargs.get("headers"), {"X-Test": "1"})
+
+
+def _anchors(median: Number, pct90: Number) -> dict:
+    return {"median": median, "pct90": pct90}
+
+
+def _cost_entry(bid_offer, rollcost, size) -> dict:
+    """Nested adapter cost entry; each arg is a (median, pct90) tuple."""
+    return {
+        "bid_offer": {"size": _anchors(*size), "cost": _anchors(*bid_offer)},
+        "rollcost": {"size": _anchors(*size), "cost": _anchors(*rollcost)},
+    }
+
+
+class TestTransactionCostsDictAdapter(unittest.TestCase):
+    def test_adapter_routes_cost_types_independently(self):
+        # The nested schema must route bid-offer and roll cost through their
+        # own anchors - the two methods return different values for the same
+        # fid and trade size when their cost anchors differ.
+        cost_dict = {
+            "USD_FX": _cost_entry(
+                bid_offer=(0.2, 0.4), rollcost=(0.05, 0.15), size=(35, 90)
+            ),
+            "EUR_FX": _cost_entry(
+                bid_offer=(0.1, 0.2), rollcost=(0.02, 0.08), size=(30, 80)
+            ),
+        }
+        adapter = TransactionCostsDictAdapter(
+            cost_dict=cost_dict, fids=["USD_FX", "EUR_FX"]
+        )
+        trade_size = 50
+        for fid in ("USD_FX", "EUR_FX"):
+            entry = cost_dict[fid]
+            exp_bo = extrapolate_cost(
+                trade_size=trade_size,
+                median_size=entry["bid_offer"]["size"]["median"],
+                median_cost=entry["bid_offer"]["cost"]["median"],
+                pct90_size=entry["bid_offer"]["size"]["pct90"],
+                pct90_cost=entry["bid_offer"]["cost"]["pct90"],
+            )
+            exp_ro = extrapolate_cost(
+                trade_size=trade_size,
+                median_size=entry["rollcost"]["size"]["median"],
+                median_cost=entry["rollcost"]["cost"]["median"],
+                pct90_size=entry["rollcost"]["size"]["pct90"],
+                pct90_cost=entry["rollcost"]["cost"]["pct90"],
+            )
+            self.assertAlmostEqual(adapter.bidoffer(fid, trade_size, "2020-01-01"), exp_bo)
+            self.assertAlmostEqual(adapter.rollcost(fid, trade_size, "2020-01-01"), exp_ro)
+            self.assertNotAlmostEqual(exp_bo, exp_ro)
+
+    def test_adapter_missing_fid(self):
+        cost_dict = {
+            "USD_FX": _cost_entry(
+                bid_offer=(0.2, 0.4), rollcost=(0.1, 0.3), size=(35, 90)
+            )
+        }
+        with self.assertRaises(ValueError):
+            TransactionCostsDictAdapter(cost_dict=cost_dict, fids=["USD_FX", "EUR_FX"])
+
+    def test_adapter_rejects_malformed_entries(self):
+        good = _cost_entry(bid_offer=(0.2, 0.4), rollcost=(0.1, 0.3), size=(35, 90))
+
+        # Missing a cost type
+        bad_missing_type = {"USD_FX": {"bid_offer": good["bid_offer"]}}
+        with self.assertRaises(ValueError):
+            TransactionCostsDictAdapter(cost_dict=bad_missing_type, fids=["USD_FX"])
+
+        # Missing a property (cost) under a cost type
+        bad_missing_prop = {
+            "USD_FX": {
+                "bid_offer": {"size": _anchors(35, 90)},
+                "rollcost": good["rollcost"],
+            }
+        }
+        with self.assertRaises(ValueError):
+            TransactionCostsDictAdapter(cost_dict=bad_missing_prop, fids=["USD_FX"])
+
+        # Missing an anchor under a property
+        bad_missing_anchor = {
+            "USD_FX": {
+                "bid_offer": {
+                    "size": {"median": 35},
+                    "cost": _anchors(0.2, 0.4),
+                },
+                "rollcost": good["rollcost"],
+            }
+        }
+        with self.assertRaises(ValueError):
+            TransactionCostsDictAdapter(cost_dict=bad_missing_anchor, fids=["USD_FX"])
+
+    def test_adapter_matches_constant_series(self):
+        np.random.seed(1)
+        fids = ["USD_FX", "EUR_FX"]
+        dates = pd.bdate_range(start="2022-01-03", end="2022-01-14")
+        # Distinct bid-offer and roll-cost anchors so the comparison would
+        # fail if either method mis-routed.
+        bo_cost, ro_cost, size = (0.2, 0.4), (0.1, 0.3), (35, 90)
+        df_const = pd.DataFrame(index=dates)
+        for fid in fids:
+            df_const[f"{fid}BIDOFFER_MEDIAN"] = bo_cost[0]
+            df_const[f"{fid}BIDOFFER_90PCTL"] = bo_cost[1]
+            df_const[f"{fid}ROLLCOST_MEDIAN"] = ro_cost[0]
+            df_const[f"{fid}ROLLCOST_90PCTL"] = ro_cost[1]
+            df_const[f"{fid}SIZE_MEDIAN"] = size[0]
+            df_const[f"{fid}SIZE_90PCTL"] = size[1]
+        df_const.index.name = "real_date"
+
+        qdf = QuantamentalDataFrame.from_wide(df_const)
+        tc_obj = TransactionCosts(df=qdf, fids=fids)
+        cost_dict = {
+            fid: _cost_entry(bid_offer=bo_cost, rollcost=ro_cost, size=size)
+            for fid in fids
+        }
+        tc_dict = TransactionCostsDictAdapter(cost_dict=cost_dict, fids=fids)
+
+        trade_sizes = [5, 35, 50, 120]
+        test_dates = [dates[0], dates[len(dates) // 2], dates[-1]]
+        for fid in fids:
+            for trade_size in trade_sizes:
+                for dt in test_dates:
+                    self.assertAlmostEqual(
+                        tc_obj.bidoffer(fid, trade_size, dt),
+                        tc_dict.bidoffer(fid, trade_size, dt),
+                    )
+                    self.assertAlmostEqual(
+                        tc_obj.rollcost(fid, trade_size, dt),
+                        tc_dict.rollcost(fid, trade_size, dt),
+                    )
+
+
+class TestDictAdapterHeatmaps(unittest.TestCase):
+    HEATMAPS = ("bidoffer_heatmap", "rollcost_heatmap")
+
+    def setUp(self):
+        self.cost_dict = {
+            "USD_FX": _cost_entry(
+                bid_offer=(0.2, 0.4), rollcost=(0.05, 0.15), size=(35, 90)
+            ),
+            "EUR_FX": _cost_entry(
+                bid_offer=(0.1, 0.2), rollcost=(0.02, 0.08), size=(30, 80)
+            ),
+            "GBP_FX": _cost_entry(
+                bid_offer=(0.3, 0.6), rollcost=(0.07, 0.21), size=(40, 95)
+            ),
+        }
+        self.adapter = TransactionCostsDictAdapter(cost_dict=self.cost_dict)
+
+    def _plotted_fids(self, method: str, **kwargs) -> List[str]:
+        module = "macrosynergy.pnl.transaction_costs"
+        with unittest.mock.patch(f"{module}.sns.heatmap") as mock_heatmap:
+            with unittest.mock.patch(f"{module}.plt.show"):
+                getattr(self.adapter, method)(**kwargs)
+        matplotlib.pyplot.close("all")
+        return list(mock_heatmap.call_args[0][0].columns)
+
+    def test_heatmaps_default_to_all_fids(self):
+        for method in self.HEATMAPS:
+            with self.subTest(method=method):
+                self.assertEqual(self._plotted_fids(method), self.adapter.fids)
+
+    def test_heatmaps_accept_fids_subset(self):
+        subset = ["EUR_FX"]
+        self.assertNotEqual(subset, self.adapter.fids)
+        for method in self.HEATMAPS:
+            with self.subTest(method=method):
+                self.assertEqual(self._plotted_fids(method, fids=subset), subset)
+
+
+if __name__ == "__main__":
+    unittest.main()
